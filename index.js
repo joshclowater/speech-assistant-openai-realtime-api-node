@@ -21,8 +21,31 @@ fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
 // Constants
-const SYSTEM_MESSAGE = 'You are a helpful and bubbly AI assistant who loves to chat about anything the user is interested about and is prepared to offer them facts. You have a penchant for dad jokes, owl jokes, and rickrolling – subtly. Always stay positive, but work in a joke when appropriate.';
-const VOICE = 'alloy';
+const SYSTEM_MESSAGE = 'You are a helpful and bubbly AI assistant. Your main objectives are: \n- determine if the customer wants a hotdog or a hamburger \n- _then_ determine which toppings they want on it. \n\nStay focused on your main objectives, do not allow the conversation to veer too far away from them. Once you have their answerof hamburger vs hotdog _and_ topping list, confirm it with the customer, then you are done!.';
+const VOICE = 'shimmer'; // alloy
+const TOOLS = [
+    {
+        type: "function",
+        name: 'submit_order',
+        description: 'Submits the customer\'s order of a hamburger or hotdog with toppings. Call this after item and toppings has been confirmed with the customer!',
+        parameters: {
+            type: 'object',
+            properties: {
+                item: {
+                    type: 'string',
+                    enum: ['hamburger', 'hotdog'],
+                    description: 'The main item the customer wants to order. This must come from the customer and be confirmed.'
+                },
+                toppings: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: 'List of toppings the customer wants on the item. This must come from the customer and be confirmed.'
+                }
+            },
+            required: ['item', 'toppings']
+        }
+    }
+];
 const PORT = process.env.PORT || 5050; // Allow dynamic port assignment
 
 // List of Event Types to log to the console. See the OpenAI Realtime API Documentation: https://platform.openai.com/docs/api-reference/realtime
@@ -34,7 +57,9 @@ const LOG_EVENT_TYPES = [
     'input_audio_buffer.committed',
     'input_audio_buffer.speech_stopped',
     'input_audio_buffer.speech_started',
-    'session.created'
+    'session.created',
+    'response.function_call_arguments.updated',
+    'response.function_call_arguments.done',
 ];
 
 // Show AI response elapsed timing calculations
@@ -46,16 +71,16 @@ fastify.get('/', async (request, reply) => {
 });
 
 // Route for Twilio to handle incoming calls
-// <Say> punctuation to improve text-to-speech translation
 fastify.all('/incoming-call', async (request, reply) => {
     const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
                           <Response>
-                              <Say>Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Open-A.I. Realtime API</Say>
+                              <Say>Please wait while we connect your call to the voice assistant.</Say>
                               <Pause length="1"/>
-                              <Say>O.K. you can start talking!</Say>
                               <Connect>
                                   <Stream url="wss://${request.headers.host}/media-stream" />
                               </Connect>
+                              <Pause length="1"/>
+                              <Say>Your order has been place. Have a nice day! Goodbye.</Say>
                           </Response>`;
 
     reply.type('text/xml').send(twimlResponse);
@@ -92,6 +117,8 @@ fastify.register(async (fastify) => {
                     instructions: SYSTEM_MESSAGE,
                     modalities: ["text", "audio"],
                     temperature: 0.8,
+                    tools: TOOLS,
+                    tool_choice: "auto",
                 }
             };
 
@@ -99,7 +126,7 @@ fastify.register(async (fastify) => {
             openAiWs.send(JSON.stringify(sessionUpdate));
 
             // Uncomment the following line to have AI speak first:
-            // sendInitialConversationItem();
+            sendInitialConversationItem();
         };
 
         // Send initial conversation item if AI talks first
@@ -112,7 +139,7 @@ fastify.register(async (fastify) => {
                     content: [
                         {
                             type: 'input_text',
-                            text: 'Greet the user with "Hello there! I am an AI voice assistant powered by Twilio and the OpenAI Realtime API. You can ask me for facts, jokes, or anything you can imagine. How can I help you?"'
+                            text: 'Greet the user with "Hello there! Welcome to Matt Williamson\'s Bistro! Do you prefer hamburgers or hotdogs?"'
                         }
                     ]
                 }
@@ -204,6 +231,46 @@ fastify.register(async (fastify) => {
                 if (response.type === 'input_audio_buffer.speech_started') {
                     handleSpeechStartedEvent();
                 }
+
+                if (response.type === 'response.function_call_arguments.done') {
+                    console.log('FUNCTIONONNNNN');
+                    // Extract function name and arguments
+                    const functionName = response.name;
+                    const argumentsString = response.arguments;
+                    const args = JSON.parse(argumentsString);
+        
+                    console.log(`~~!!~~ Assistant is calling function: ${functionName} with args:`, args);
+        
+                    // Execute the function
+                    let functionResult = {};
+                    if (functionName === 'submit_order') {
+                        functionResult = handleGetOrder(args);
+                    } else {
+                        console.error(`Unknown function: ${functionName}`);
+                    }
+        
+                    // Send the function result back to OpenAI
+                    const functionResultMessage = {
+                        type: 'conversation.item.create',
+                        item: {
+                            type: 'message',
+                            role: 'function',
+                            name: functionName,
+                            content: [
+                                {
+                                    type: 'function_result',
+                                    data: JSON.stringify(functionResult)
+                                }
+                            ]
+                        }
+                    };
+                    console.log('Sending function result to OpenAI:', functionResultMessage);
+                    openAiWs.send(JSON.stringify(functionResultMessage));
+        
+                    // Request a new response from OpenAI
+                    openAiWs.send(JSON.stringify({ type: 'response.create' }));
+                }
+        
             } catch (error) {
                 console.error('Error processing OpenAI message:', error, 'Raw message:', data);
             }
@@ -262,6 +329,30 @@ fastify.register(async (fastify) => {
         openAiWs.on('error', (error) => {
             console.error('Error in the OpenAI WebSocket:', error);
         });
+
+        const handleGetOrder = (args) => {
+            const item = args.item;
+            const toppings = args.toppings || [];
+            console.log(`Handling get_order with item: ${item}, toppings: ${toppings.join(', ')}`);
+            // Implement your logic here, e.g., save order to a database
+            // return { confirmation: `You ordered a ${item} with ${toppings.join(', ')}` };
+            endSessionWithCleanup();
+        }
+        
+        // Function to end the session and perform cleanup
+        function endSessionWithCleanup() {
+            // Close the OpenAI WebSocket if it's open
+            if (openAiWs.readyState === WebSocket.OPEN) {
+                openAiWs.close();
+                console.log('Closed OpenAI WebSocket connection.');
+            }
+        
+            // Close the Twilio WebSocket connection
+            if (connection) {
+                connection.close();
+                console.log('Closed Twilio WebSocket connection.');
+            }
+        }
     });
 });
 
